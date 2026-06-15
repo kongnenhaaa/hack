@@ -6,18 +6,18 @@ import de.robv.android.xposed.callbacks.XC_LoadPackage
 
 class MainXposed : IXposedHookLoadPackage {
 
+    companion object {
+        private const val TARGET_PACKAGE = "com.zing.zalo"
+    }
+
     override fun handleLoadPackage(lpparam: XC_LoadPackage.LoadPackageParam) {
-        if (lpparam.packageName != "com.zing.zalo") return
+        if (lpparam.packageName != TARGET_PACKAGE) return
 
-        Log.d("ZaloHacker", "✅ Injecting into Zalo: ${lpparam.packageName}")
-
-        try { ZaloHooker.hookOkHttp(lpparam.classLoader) } catch (e: Exception) { Log.e("ZaloHacker", "OkHttp failed", e) }
-        try { ZaloHooker.hookWebView(lpparam.classLoader) } catch (e: Exception) { Log.e("ZaloHacker", "WebView failed", e) }
-        try { ZaloHooker.hookSharedPreferences(lpparam.classLoader) } catch (e: Exception) { Log.e("ZaloHacker", "SharedPrefs failed", e) }
-        try { ZaloHooker.hookHttpUrlConnection(lpparam.classLoader) } catch (e: Exception) { Log.e("ZaloHacker", "HttpURLConn failed", e) }
-        try { ZaloHooker.hookJavaScriptInterface(lpparam.classLoader) } catch (e: Exception) { Log.e("ZaloHacker", "JSInterface failed", e) }
-
-        Log.d("ZaloHacker", "✅ All hooks installed for Zalo v26.05.01")
+        Log.d("VDLogger", "Attaching to Zalo...")
+        try {
+            ZaloHooker.install(lpparam)
+        } catch (e: Exception) {
+            Log.e("VDLogger", "Failed to install Zalo hooks", e)
+        }
     }
 }
-

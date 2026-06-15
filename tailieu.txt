@@ -1,0 +1,18 @@
+getAccessToken
+Trước
+Kế tiếp
+Cập nhật lần cuối: 8/1/2026
+import { getAccessToken } from "zmp-sdk/apis";
+
+API dùng để lấy thông tin xác thực người dùng.
+
+Cập nhật
+Từ phiên bản SDK 2.35.0, ứng dụng mặc định có quyền truy xuất access tokens mà không cần người dùng xác nhận đồng ý. Thông qua access tokens này, ứng dụng chỉ có thể xuất ID người sử dụng. Nếu ứng dụng có nhu cầu sử dụng Tên và Ảnh đại diện, vui lòng sử dụng API authorize để yêu cầu người dùng cho phép truy cập scope.userInfo trước khi sử dụng API này. Lưu ý: Với các Zalo App có nhiều hơn 1 Mini App, hệ thống vẫn yêu cầu người dùng xác nhận khi truy xuất access tokens cho từng Mini App.
+
+Ví dụ
+const accessToken = await getAccessToken();
+
+Xem hướng dẫn xử lý lỗi và bảng mô tả chi tiết mã lỗi tại đây.
+Kết quả trả về
+API trả về Promise<string> chứa accessToken.
+

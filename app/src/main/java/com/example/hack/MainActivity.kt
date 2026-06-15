@@ -112,7 +112,7 @@ class MainActivity : AppCompatActivity() {
         adapter = AppAdapter(
             displayApps,
             onTriggerClick = { app ->
-                val deeplink = app.optString("deeplink")
+                val appId = app.optString("app_id")
                 val name = app.optString("name")
                 appendLog("[INFO] [$name] Đang gọi lệnh Root Trigger...")
                 
@@ -143,7 +143,7 @@ class MainActivity : AppCompatActivity() {
                 timeoutRunnable = runnable
                 mainHandler.postDelayed(runnable, 20000)
                 
-                triggerDeepLinkRoot(deeplink)
+                triggerAppRoot(appId)
             },
             onEditClick = { app ->
                 showEditAppDialog(app)
@@ -453,7 +453,10 @@ class MainActivity : AppCompatActivity() {
             .show()
     }
 
-    private fun triggerDeepLinkRoot(deeplink: String) {
+    private fun triggerAppRoot(appId: String) {
+        val prefs = getSharedPreferences("autopee_prefs", Context.MODE_PRIVATE)
+        prefs.edit().putString("pending_trigger_appid", appId).apply()
+
         Thread {
             try {
                 // Thoát Zalo
@@ -466,28 +469,25 @@ class MainActivity : AppCompatActivity() {
                 
                 Thread.sleep(1000)
 
-                // Mở DeepLink
-                val safeLink = deeplink.replace("\"", "\\\"")
-                val process = Runtime.getRuntime().exec("su")
-                val os = java.io.DataOutputStream(process.outputStream)
-                os.writeBytes("am start -a android.intent.action.VIEW -p com.zing.zalo -f 268435456 -d \"$safeLink\"\n")
-                os.writeBytes("exit\n")
-                os.flush()
-                
-                val exitCode = process.waitFor()
-                
-                runOnUiThread {
-                    if (exitCode == 0) {
-                        appendLog("[OK] Đã gửi lệnh mở Zalo thành công.")
-                    } else {
-                        appendLog("[WARN] Lệnh SU chạy xong nhưng có lỗi (Mã $exitCode)")
+                // Mở Zalo launcher/main activity
+                val pm = packageManager
+                val zaloMain = pm.getLaunchIntentForPackage("com.zing.zalo")
+                if (zaloMain != null) {
+                    zaloMain.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                    startActivity(zaloMain)
+                    runOnUiThread {
+                        appendLog("[OK] Đã gửi lệnh force-stop và khởi động lại Zalo.")
+                    }
+                } else {
+                    runOnUiThread {
+                        appendLog("[WARN] Không tìm thấy ứng dụng Zalo.")
                         tvLogStatus.text = "● ERROR"
                         tvLogStatus.setTextColor(android.graphics.Color.parseColor("#FF5252"))
                     }
                 }
             } catch (e: Exception) {
                 runOnUiThread {
-                    appendLog("[WARN] Lỗi Root (Máy chưa có Magisk/SU?): ${e.message}")
+                    appendLog("[WARN] Lỗi Root Trigger: ${e.message}")
                     tvLogStatus.text = "● ERROR"
                     tvLogStatus.setTextColor(android.graphics.Color.parseColor("#FF5252"))
                 }

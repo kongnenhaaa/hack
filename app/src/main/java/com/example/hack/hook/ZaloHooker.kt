@@ -1,29 +1,501 @@
 package com.example.hack.hook
 
+import android.app.Activity
+import android.content.BroadcastReceiver
+import android.content.Context
+import android.content.Intent
+import android.content.IntentFilter
+import android.net.Uri
+import android.os.Build
+import android.os.Bundle
+import android.os.Handler
+import android.os.Looper
+import android.os.Process
 import android.util.Log
+import android.webkit.CookieManager
+import android.webkit.ValueCallback
+import android.webkit.WebStorage
 import de.robv.android.xposed.XC_MethodHook
-import de.robv.android.xposed.XposedBridge
 import de.robv.android.xposed.XposedHelpers
+import de.robv.android.xposed.callbacks.XC_LoadPackage
+import org.json.JSONArray
 import org.json.JSONObject
-import java.io.OutputStreamWriter
+import java.io.DataOutputStream
+import java.io.File
+import java.lang.ref.WeakReference
 import java.net.HttpURLConnection
 import java.net.URL
+import java.util.UUID
+import java.util.concurrent.ConcurrentHashMap
 import kotlin.concurrent.thread
 
+data class AppConfig(
+    var id: String = "",
+    var name: String = "",
+    var appId: String = "",
+    var adbPrefix: String = "",
+    var deeplink: String = ""
+) {
+    fun getMiniAppUrl(): String {
+        return "https://zalo.me/s/$appId/"
+    }
+
+    fun getTriggerAction(): String {
+        return "$adbPrefix.TRIGGER"
+    }
+
+    fun getGetTokenAction(): String {
+        return "$adbPrefix.GET_TOKEN"
+    }
+
+    fun getCachePath(): String {
+        return "/data/data/com.zing.zalo/cache/zalo/inappBrowser/zBrowser/mpds/$appId"
+    }
+}
+
 object ZaloHooker {
-
-    private val seenTokens = mutableSetOf<String>()
-    private const val TAG = "ZaloHacker"
-
-    private val hookedClients = mutableSetOf<String>()
-    private val hookedChromeClients = mutableSetOf<String>()
-
+    private const val TAG = "VDLogger"
+    
     @Volatile
-    private var activeAppId: String = ""
+    private var initialized = false
+    
+    @Volatile
+    private var captureArmed = false
+    
+    @Volatile
+    private var currentApp: AppConfig? = null
+    
+    private var zaloActivity: WeakReference<Activity>? = null
+    private var registeredConfigs: List<AppConfig> = emptyList()
+    private val tokenStore = ConcurrentHashMap<String, String>()
+
+    fun install(lpparam: XC_LoadPackage.LoadPackageParam) {
+        // Hook Activity lifecycle
+        try {
+            XposedHelpers.findAndHookMethod(
+                Activity::class.java,
+                "onCreate",
+                Bundle::class.java,
+                object : XC_MethodHook() {
+                    override fun afterHookedMethod(param: MethodHookParam) {
+                        val act = param.thisObject as Activity
+                        zaloActivity = WeakReference(act)
+                        if (!initialized) {
+                            initialized = true
+                            broadcastLog("CONFIG", "Hook attached. Requesting config...")
+                            requestConfigViaBroadcast(act.applicationContext)
+                        }
+                    }
+                }
+            )
+        } catch (t: Throwable) {
+            Log.e(TAG, "Hook Activity.onCreate failed", t)
+        }
+
+        try {
+            XposedHelpers.findAndHookMethod(
+                Activity::class.java,
+                "onResume",
+                object : XC_MethodHook() {
+                    override fun afterHookedMethod(param: MethodHookParam) {
+                        val act = param.thisObject as Activity
+                        zaloActivity = WeakReference(act)
+                    }
+                }
+            )
+        } catch (t: Throwable) {
+            Log.e(TAG, "Hook Activity.onResume failed", t)
+        }
+
+        // Hook WebView core methods
+        try {
+            val wvClass = XposedHelpers.findClassIfExists("android.webkit.WebView", lpparam.classLoader)
+            if (wvClass != null) {
+                // Hook evaluateJavascript
+                XposedHelpers.findAndHookMethod(
+                    wvClass,
+                    "evaluateJavascript",
+                    String::class.java,
+                    ValueCallback::class.java,
+                    object : XC_MethodHook() {
+                        override fun beforeHookedMethod(param: MethodHookParam) {
+                            val script = param.args[0] as? String ?: return
+                            processScript(script)
+                        }
+                    }
+                )
+                Log.d(TAG, "[Zalo] hooked evaluateJavascript")
+
+                // Hook loadUrl
+                XposedHelpers.findAndHookMethod(
+                    wvClass,
+                    "loadUrl",
+                    String::class.java,
+                    object : XC_MethodHook() {
+                        override fun beforeHookedMethod(param: MethodHookParam) {
+                            val url = param.args[0] as? String ?: return
+                            if (url.startsWith("javascript:")) {
+                                processScript(url)
+                            } else {
+                                autoDetectApp(url)
+                            }
+                        }
+                    }
+                )
+                Log.d(TAG, "[Zalo] hooked loadUrl")
+            } else {
+                Log.e(TAG, "[Zalo] WebView class not found")
+            }
+        } catch (e: Throwable) {
+            Log.e(TAG, "[Zalo] WebView hook failed", e)
+        }
+    }
+
+    private fun requestConfigViaBroadcast(context: Context) {
+        // Register com.autopee.ARM_CAPTURE
+        try {
+            val armReceiver = object : BroadcastReceiver() {
+                override fun onReceive(ctx: Context, intent: Intent) {
+                    captureArmed = true
+                    broadcastLog("TRIGGER", "captureArmed = true (ARM broadcast)")
+                }
+            }
+            val af = IntentFilter("com.autopee.ARM_CAPTURE")
+            if (Build.VERSION.SDK_INT >= 33) {
+                context.registerReceiver(armReceiver, af, Context.RECEIVER_EXPORTED)
+            } else {
+                context.registerReceiver(armReceiver, af)
+            }
+        } catch (e: Throwable) {}
+
+        // Register com.autopee.KILL_ZALO
+        try {
+            val killReceiver = object : BroadcastReceiver() {
+                override fun onReceive(ctx: Context, intent: Intent) {
+                    try {
+                        ctx.unregisterReceiver(this)
+                    } catch (e: Exception) {}
+                    broadcastLog("WARN", "Zalo restarting for fresh OAuth...")
+                    Handler(Looper.getMainLooper()).postDelayed({
+                        Process.killProcess(Process.myPid())
+                    }, 400L)
+                }
+            }
+            val kf = IntentFilter("com.autopee.KILL_ZALO")
+            if (Build.VERSION.SDK_INT >= 33) {
+                context.registerReceiver(killReceiver, kf, Context.RECEIVER_EXPORTED)
+            } else {
+                context.registerReceiver(killReceiver, kf)
+            }
+        } catch (e: Throwable) {}
+
+        // Register com.autopee.CONFIG_RESPONSE
+        try {
+            val responseReceiver = object : BroadcastReceiver() {
+                override fun onReceive(ctx: Context, intent: Intent) {
+                    val json = intent.getStringExtra("configs") ?: "[]"
+                    val pendingAppId = intent.getStringExtra("pendingAppId")
+                    val configs = parseConfigs(json)
+                    
+                    // If we already have registered configs, and this one is empty, ignore it to prevent race condition
+                    if (configs.isEmpty() && registeredConfigs.isNotEmpty()) {
+                        return
+                    }
+                    
+                    if (configs.isNotEmpty()) {
+                        try {
+                            ctx.unregisterReceiver(this)
+                        } catch (e: Exception) {}
+                    }
+                    
+                    Log.d(TAG, "[Zalo] CONFIG_RESPONSE: ${json.take(120)}")
+                    registeredConfigs = configs
+                    val n = configs.size
+                    Log.d(TAG, "[Zalo] Hook ready. $n app(s) registered.")
+                    broadcastLog(if (n > 0) "OK" else "WARN", "Hook ready. $n app(s) registered.")
+                    
+                    for (c in configs) {
+                        Log.d(TAG, "[Zalo]   ${c.name} → adb shell am broadcast -a ${c.getTriggerAction()}")
+                        broadcastLog("CONFIG", "${c.name} | ${c.appId}")
+                    }
+                    
+                    registerBroadcastController(ctx, configs)
+                    
+                    if (pendingAppId != null) {
+                        for (c in configs) {
+                            if (c.appId == pendingAppId) {
+                                broadcastLog("TRIGGER", "Auto-trigger: ${c.name}")
+                                Handler(Looper.getMainLooper()).postDelayed({
+                                    triggerApp(ctx, c, true)
+                                }, 800L)
+                                break
+                            }
+                        }
+                    }
+                }
+            }
+            val filter = IntentFilter("com.autopee.CONFIG_RESPONSE")
+            if (Build.VERSION.SDK_INT >= 33) {
+                context.registerReceiver(responseReceiver, filter, Context.RECEIVER_EXPORTED)
+            } else {
+                context.registerReceiver(responseReceiver, filter)
+            }
+        } catch (e: Throwable) {}
+
+        // Send CONFIG_REQUEST
+        val req = Intent("com.autopee.REQUEST_CONFIG")
+        try {
+            val intent1 = Intent(req).apply { `package` = "com.autopee" }
+            context.sendBroadcast(intent1)
+        } catch (e: Throwable) {}
+        try {
+            val intent2 = Intent(req).apply { `package` = "com.example.hack" }
+            context.sendBroadcast(intent2)
+        } catch (e: Throwable) {}
+        Log.d(TAG, "[Zalo] REQUEST_CONFIG sent to module app")
+    }
+
+    private fun registerBroadcastController(context: Context, configs: List<AppConfig>) {
+        if (configs.isEmpty()) return
+        try {
+            val receiver = object : BroadcastReceiver() {
+                override fun onReceive(ctx: Context, intent: Intent) {
+                    val action = intent.action ?: return
+                    for (cfg in registeredConfigs) {
+                        if (action == cfg.getTriggerAction()) {
+                            Log.d(TAG, "[${cfg.name}] <<< TRIGGER via broadcast >>>")
+                            triggerApp(ctx, cfg, false)
+                            return
+                        } else if (action == cfg.getGetTokenAction()) {
+                            val token = tokenStore[cfg.appId]
+                            Log.d(TAG, "TOKEN_RESULT:${cfg.adbPrefix}:${token ?: "null"}")
+                            return
+                        }
+                    }
+                }
+            }
+            val filter = IntentFilter()
+            for (cfg in configs) {
+                filter.addAction(cfg.getTriggerAction())
+                filter.addAction(cfg.getGetTokenAction())
+            }
+            if (Build.VERSION.SDK_INT >= 33) {
+                context.registerReceiver(receiver, filter, Context.RECEIVER_EXPORTED)
+            } else {
+                context.registerReceiver(receiver, filter)
+            }
+            Log.d(TAG, "[Zalo] BroadcastController registered ${configs.size} app(s)")
+        } catch (t: Throwable) {
+            Log.e(TAG, "BroadcastController registration failed", t)
+        }
+    }
+
+    private fun triggerApp(context: Context, app: AppConfig, fromAutoTrigger: Boolean) {
+        currentApp = app
+        captureArmed = true
+        tokenStore.remove(app.appId)
+        broadcastLog("TRIGGER", "<<< TRIGGER: ${app.name} >>>")
+        
+        // Clear caches
+        try {
+            deleteDir(File(app.getCachePath()))
+        } catch (th: Throwable) {}
+        
+        // Clear cookies
+        try {
+            val cm = CookieManager.getInstance()
+            val domains = arrayOf("h5.zdn.vn", "h5.zalo.me", "zalo.me", "zdn.vn", "mini.zalo.me")
+            for (d in domains) {
+                cm.setCookie(d, "zoauth; expires=Thu, 01 Jan 1970 00:00:01 GMT; path=/")
+                cm.setCookie(d, "zoauth_vrf; expires=Thu, 01 Jan 1970 00:00:01 GMT; path=/")
+            }
+            cm.flush()
+            WebStorage.getInstance().deleteAllData()
+            broadcastLog("INFO", "[${app.name}] OAuth session cleared")
+        } catch (e: Exception) {
+            broadcastLog("WARN", "Cookie clear error: ${e.message}")
+        }
+
+        if (fromAutoTrigger) {
+            try {
+                val intent = Intent("android.intent.action.VIEW").apply {
+                    data = Uri.parse(app.getMiniAppUrl())
+                    `package` = "com.zing.zalo"
+                    flags = 335544320 // FLAG_ACTIVITY_NEW_TASK or FLAG_ACTIVITY_CLEAR_TOP
+                }
+                context.startActivity(intent)
+                broadcastLog("INFO", "[${app.name}] Mini app launched (auto-trigger, fresh)")
+            } catch (e: Exception) {
+                broadcastLog("ERROR", "Launch failed: ${e.message}")
+            }
+        } else {
+            broadcastLog("WARN", "[${app.name}] Zalo restarting for fresh OAuth...")
+            Handler(Looper.getMainLooper()).postDelayed({
+                Process.killProcess(Process.myPid())
+            }, 400L)
+        }
+    }
+
+    private fun deleteDir(f: File) {
+        if (f.isDirectory) {
+            f.listFiles()?.forEach { deleteDir(it) }
+        }
+        f.delete()
+    }
+
+    private fun processScript(script: String) {
+        if (script.contains("cookiesOAuthLogins")) {
+            if (!captureArmed) {
+                broadcastLog("INFO", "OAuth script seen but not armed — skipping (call ARM/TRIGGER first)")
+                return
+            }
+            var app = currentApp
+            if (app == null) {
+                val cfgs = registeredConfigs
+                if (cfgs.size == 1) {
+                    app = cfgs[0]
+                    currentApp = app
+                    broadcastLog("INFO", "Auto-selected app: ${app.name}")
+                } else {
+                    broadcastLog("WARN", "OAuth script found but no currentApp set")
+                    return
+                }
+            }
+            
+            val finalApp = app!!
+            Log.d(TAG, "[${finalApp.name}] OAuth script intercepted")
+            broadcastLog("INFO", "[${finalApp.name}] OAuth script intercepted, exchanging...")
+            
+            try {
+                val jsonStr = extractJson(script) ?: return
+                val root = JSONObject(jsonStr)
+                val dataObj = root.optJSONObject("data")
+                val cookies = dataObj?.optJSONArray("cookiesOAuthLogins") ?: root.optJSONArray("cookiesOAuthLogins")
+                if (cookies == null) return
+                
+                var zoauth: String? = null
+                var zoauthVrf: String? = null
+                
+                for (i in 0 until cookies.length()) {
+                    val c = cookies.getJSONObject(i)
+                    val name = c.optString("name", "")
+                    val value = c.optString("value", "")
+                    if (name.contains("zoauth_vrf")) {
+                        zoauthVrf = value
+                    } else if (name.contains("zoauth")) {
+                        zoauth = value
+                    }
+                }
+                
+                if (!zoauth.isNullOrEmpty() && !zoauthVrf.isNullOrEmpty()) {
+                    Log.d(TAG, "[${finalApp.name}] Credentials captured, exchanging...")
+                    captureArmed = false
+                    exchangeToken(finalApp, zoauth, zoauthVrf)
+                }
+            } catch (e: Throwable) {
+                Log.e(TAG, "[${finalApp.name}] processScript error", e)
+            }
+        }
+    }
+
+    private fun autoDetectApp(url: String) {
+        val cfgs = registeredConfigs
+        if (cfgs.isEmpty()) return
+        for (cfg in cfgs) {
+            if (cfg.appId.isNotEmpty() && url.contains(cfg.appId)) {
+                if (currentApp == null || currentApp?.appId != cfg.appId) {
+                    currentApp = cfg
+                    Log.d(TAG, "[Zalo] Auto-detected mini app: ${cfg.name} from URL")
+                    broadcastLog("INFO", "Detected: ${cfg.name} (auto)")
+                }
+                return
+            }
+        }
+    }
+
+    private fun exchangeToken(cfg: AppConfig, zoauth: String, zoauthVrf: String) {
+        thread {
+            try {
+                val url = URL("https://h5.zalo.me/openapi/access_token")
+                val conn = url.openConnection() as HttpURLConnection
+                conn.requestMethod = "POST"
+                conn.setRequestProperty("host", "h5.zalo.me")
+                conn.setRequestProperty("content-type", "application/x-www-form-urlencoded")
+                conn.setRequestProperty("user-agent", "Mozilla/5.0 (Linux; Android 12L; Nokia 5.3 Build/RKQ1.201004.002;) AppleWebKit/537.36 (KHTML, like Gecko) Version/4.0 Chrome/147.0.7727.137 Mobile Safari/537.36 Zalo android/260402903 ZaloTheme/light ZaloLanguage/en")
+                conn.setRequestProperty("x-requested-with", "com.zing.zalo")
+                conn.setRequestProperty("origin", "https://h5.zdn.vn")
+                conn.setRequestProperty("referer", "https://h5.zdn.vn/")
+                conn.doOutput = true
+                conn.connectTimeout = 15000
+                conn.readTimeout = 15000
+                
+                val body = "app_id=${cfg.appId}&code=$zoauth&code_verifier=$zoauthVrf&grant_type=authorization_code"
+                DataOutputStream(conn.outputStream).use { dos ->
+                    dos.writeBytes(body)
+                    dos.flush()
+                }
+                
+                val code = conn.responseCode
+                val stream = if (code == 200) conn.inputStream else conn.errorStream
+                if (stream == null) return@thread
+                
+                val raw = stream.bufferedReader().readText()
+                conn.disconnect()
+                
+                val api = JSONObject(raw)
+                val result = JSONObject()
+                if (api.has("access_token")) {
+                    val accessToken = api.getString("access_token")
+                    result.put("status", true)
+                    result.put("app_id", cfg.appId)
+                    result.put("name", cfg.name)
+                    result.put("access_token", accessToken)
+                    if (api.has("refresh_token")) {
+                        result.put("refresh_token", api.getString("refresh_token"))
+                    }
+                    if (api.has("expires_in")) {
+                        result.put("expires_in", api.getLong("expires_in"))
+                    }
+                    if (api.has("uid")) {
+                        result.put("uid", api.optString("uid", ""))
+                    }
+                    result.put("captured_at", System.currentTimeMillis())
+                    
+                    broadcastLog("OK", "[${cfg.name}] Token OK! access_token=${accessToken.take(12)}...")
+                    
+                    val resultStr = result.toString()
+                    tokenStore[cfg.appId] = resultStr
+                    Log.d(TAG, "TOKEN_RESULT:${cfg.adbPrefix}:$resultStr")
+                    
+                    // Broadcast success back to UI app
+                    broadcastToken(cfg, resultStr)
+                    
+                    // Also forward to user's webhook configuration for backward compatibility
+                    sendTokenToWebhook(accessToken, raw, cfg.appId)
+                } else {
+                    result.put("status", false)
+                    result.put("app_id", cfg.appId)
+                    result.put("name", cfg.name)
+                    result.put("error", raw)
+                    result.put("captured_at", System.currentTimeMillis())
+                    
+                    broadcastLog("ERROR", "[${cfg.name}] Exchange failed: ${raw.take(80)}")
+                    val resultStr = result.toString()
+                    tokenStore[cfg.appId] = resultStr
+                    Log.d(TAG, "TOKEN_RESULT:${cfg.adbPrefix}:$resultStr")
+                    
+                    broadcastToken(cfg, resultStr)
+                }
+            } catch (e: Throwable) {
+                Log.e(TAG, "[${cfg.name}] Token exchange failed", e)
+                broadcastLog("ERROR", "Exchange failed: ${e.message}")
+            }
+        }
+    }
 
     private fun getWebhookUrl(): String {
         try {
-            val configFile = java.io.File(
+            val configFile = File(
                 android.os.Environment.getExternalStoragePublicDirectory(android.os.Environment.DIRECTORY_DOWNLOADS),
                 "zalo_hacker_config.txt"
             )
@@ -36,18 +508,8 @@ object ZaloHooker {
     }
 
     private fun getAppName(appId: String): String {
-        // Hardcoded defaults
-        val defaults = mapOf(
-            "3151270984274302494" to "7up",
-            "2284259347200678918" to "Coca"
-        )
-        if (defaults.containsKey(appId)) {
-            return defaults[appId]!!
-        }
-
-        // Try reading from user-added apps config file generated by MainActivity
         try {
-            val appsFile = java.io.File(
+            val appsFile = File(
                 android.os.Environment.getExternalStoragePublicDirectory(android.os.Environment.DIRECTORY_DOWNLOADS),
                 "zalo_hacker_apps.txt"
             )
@@ -58,72 +520,10 @@ object ZaloHooker {
                 }
             }
         } catch (_: Throwable) {}
-
         return "MiniApp_$appId"
     }
 
-    private fun extractAppId(rawData: String): String {
-        // 1. Check URL path pattern: /zapps/<appId>/
-        "/zapps/(\\d+)".toRegex().find(rawData)?.let {
-            val id = it.groupValues[1]
-            activeAppId = id
-            return id
-        }
-        
-        // 2. Check JSON pattern: "appId":"3151..." or "app_id":3151...
-        "\"app_?[iI]d\"\\s*:\\s*\"?(\\d+)\"?".toRegex().find(rawData)?.let {
-            val id = it.groupValues[1]
-            activeAppId = id
-            return id
-        }
-
-        // 3. Check Query parameter pattern: appId=3151... or app_id=3151...
-        "app_?[iI]d=(\\d+)".toRegex(RegexOption.IGNORE_CASE).find(rawData)?.let {
-            val id = it.groupValues[1]
-            activeAppId = id
-            return id
-        }
-
-        return ""
-    }
-
-    private fun sendTokenToServer(token: String, source: String, rawData: String) {
-        if (token.length < 30) return
-        val key = token.substring(0, 20)
-        
-        if (seenTokens.contains(key)) {
-            Log.d(TAG, "Token trùng lặp ($source), bỏ qua gửi server nhưng phát broadcast đóng Zalo.")
-            broadcastTokenCaptured()
-            return
-        }
-        seenTokens.add(key)
-
-        Log.i(TAG, "🔥 TOKEN BẮT ĐƯỢC từ [$source]: ${token.substring(0, 15)}...")
-
-        var refreshToken = token
-        try {
-            "\"refresh_token\"\\s*:\\s*\"([^\"]+)\"".toRegex().find(rawData)?.let { refreshToken = it.groupValues[1] }
-        } catch (e: Throwable) {}
-        
-        // Extract appId with dynamic tracking
-        var appId = extractAppId(rawData)
-        if (appId.isEmpty()) {
-            appId = activeAppId
-        }
-
-        val name = if (appId.isNotEmpty()) getAppName(appId) else "MiniApp"
-
-        val payload = JSONObject().apply {
-            put("status", true)
-            put("app_id", appId)
-            put("name", name)
-            put("access_token", token)
-            put("refresh_token", refreshToken)
-            put("expires_in", 3600)
-            put("captured_at", System.currentTimeMillis())
-            put("source", source)
-        }
-
+    private fun sendTokenToWebhook(token: String, rawData: String, appId: String) {
         thread {
             try {
                 val targetUrl = getWebhookUrl()
@@ -131,325 +531,160 @@ object ZaloHooker {
                 conn.requestMethod = "POST"
                 conn.setRequestProperty("Content-Type", "application/json")
                 conn.doOutput = true
-                OutputStreamWriter(conn.outputStream).use { it.write(payload.toString()) }
-                val code = conn.responseCode
-                Log.d(TAG, "Đã gửi webhook ($targetUrl). HTTP $code")
-                broadcastLog("[$source] Token OK! ${token.substring(0, 12)}...")
                 
-                // Broadcast success event to return to Zalo Token app
-                broadcastTokenCaptured()
+                val name = getAppName(appId)
+                val payload = JSONObject().apply {
+                    put("status", true)
+                    put("app_id", appId)
+                    put("name", name)
+                    put("access_token", token)
+                    try {
+                        val api = JSONObject(rawData)
+                        if (api.has("refresh_token")) {
+                            put("refresh_token", api.getString("refresh_token"))
+                        } else {
+                            put("refresh_token", token)
+                        }
+                    } catch (e: Throwable) {
+                        put("refresh_token", token)
+                    }
+                    put("expires_in", 3600)
+                    put("captured_at", System.currentTimeMillis())
+                    put("source", "CookiesOAuthExchange")
+                }
+                
+                java.io.OutputStreamWriter(conn.outputStream).use { it.write(payload.toString()) }
+                val code = conn.responseCode
+                Log.d(TAG, "Sent token to webhook ($targetUrl). HTTP $code")
+                broadcastLog("OK", "Webhook sent! HTTP $code")
             } catch (e: Throwable) {
-                Log.e(TAG, "Lỗi gửi token: ${e.message}")
-                broadcastLog("[ERROR] ${e.message}")
+                Log.e(TAG, "Failed to send token to webhook: ${e.message}")
             }
         }
     }
 
-    private fun tryParseToken(data: String?, source: String) {
-        if (data.isNullOrEmpty() || data.length < 30) return
+    private fun broadcastToken(cfg: AppConfig, tokenJson: String) {
         try {
-            val tokenRegex = "\"access_token\"\\s*:\\s*\"([^\"]{30,})\"".toRegex()
-            val jwtRegex = "\"jwt\"\\s*:\\s*\"([^\"]{30,})\"".toRegex()
-            val bearerRegex = "Bearer ([A-Za-z0-9\\-_.~+/]+=*)".toRegex()
-            var match = tokenRegex.find(data) ?: jwtRegex.find(data) ?: bearerRegex.find(data)
-            if (match != null) {
-                sendTokenToServer(match.groupValues[1], source, data)
+            val act = zaloActivity?.get()
+            val context = act?.applicationContext ?: run {
+                val at = XposedHelpers.callStaticMethod(
+                    XposedHelpers.findClass("android.app.ActivityThread", null),
+                    "currentActivityThread"
+                )
+                XposedHelpers.callMethod(at, "getSystemContext") as? Context
+            } ?: return
+
+            val intent = Intent("com.autopee.TOKEN_CAPTURED").apply {
+                putExtra("appId", cfg.appId)
+                putExtra("name", cfg.name)
+                putExtra("tokenJson", tokenJson)
             }
-        } catch (e: Throwable) {
-            Log.e(TAG, "Parse error", e)
-        }
-    }
-
-    private fun broadcastLog(message: String) {
-        try {
-            val at = XposedHelpers.callStaticMethod(
-                XposedHelpers.findClass("android.app.ActivityThread", null),
-                "currentActivityThread"
-            )
-            val ctx = XposedHelpers.callMethod(at, "getSystemContext") as? android.content.Context
-            ctx?.sendBroadcast(android.content.Intent("com.autopee.LOG_EVENT").apply {
-                putExtra("log", message)
-            })
-        } catch (_: Throwable) {}
-    }
-
-    private fun broadcastTokenCaptured() {
-        try {
-            val at = XposedHelpers.callStaticMethod(
-                XposedHelpers.findClass("android.app.ActivityThread", null),
-                "currentActivityThread"
-            )
-            val ctx = XposedHelpers.callMethod(at, "getSystemContext") as? android.content.Context
-            ctx?.sendBroadcast(android.content.Intent("com.autopee.TOKEN_CAPTURED"))
-        } catch (_: Throwable) {}
-    }
-
-    // ─────────────────────────────────────────────────
-    // HOOK 1: OkHttp
-    // ─────────────────────────────────────────────────
-    fun hookOkHttp(classLoader: ClassLoader) {
-        val candidateClasses = listOf(
-            "okhttp3.ResponseBody",
-            "okhttp3.internal.http.RealResponseBody",
-            "com.squareup.okhttp3.ResponseBody",
-            "j.b",  // obfuscated variants
-            "k.b",
-            "l.b"
-        )
-        for (className in candidateClasses) {
+            
             try {
-                val cls = XposedHelpers.findClass(className, classLoader)
-                XposedBridge.hookAllMethods(cls, "string", object : XC_MethodHook() {
-                    override fun afterHookedMethod(param: MethodHookParam) {
-                        val result = param.result as? String ?: return
-                        tryParseToken(result, "OkHttp/$className")
-                    }
-                })
-                Log.d(TAG, "✅ OkHttp ResponseBody.string() hooked: $className")
-                break
-            } catch (_: Throwable) {}
+                context.sendBroadcast(Intent(intent).apply { `package` = "com.autopee" })
+            } catch (e: Throwable) {}
+            try {
+                context.sendBroadcast(Intent(intent).apply { `package` = "com.example.hack" })
+            } catch (e: Throwable) {}
+            context.sendBroadcast(intent)
+            Log.d(TAG, "[${cfg.name}] TOKEN_CAPTURED broadcast sent to UI")
+        } catch (e: Exception) {
+            Log.w(TAG, "[${cfg.name}] broadcastToken failed: ${e.message}")
         }
     }
 
-    // ─────────────────────────────────────────────────
-    // HOOK 2: WebView Client subclasses
-    // ─────────────────────────────────────────────────
-    private fun hookWebViewClientSubclass(clazz: Class<*>) {
-        val className = clazz.name
-        if (hookedClients.contains(className)) return
-        hookedClients.add(className)
-
-        // Hook shouldOverrideUrlLoading (cả String và WebResourceRequest)
+    private fun broadcastLog(level: String, msg: String) {
+        val message = "[$level] $msg"
+        Log.d(TAG, message)
         try {
-            XposedBridge.hookAllMethods(clazz, "shouldOverrideUrlLoading", object : XC_MethodHook() {
-                override fun beforeHookedMethod(param: MethodHookParam) {
-                    val arg1 = param.args.getOrNull(1) ?: return
-                    var url: String? = null
-                    if (arg1 is String) {
-                        url = arg1
-                    } else {
-                        try {
-                            val getUrlMethod = arg1.javaClass.getMethod("getUrl")
-                            val uri = getUrlMethod.invoke(arg1) as? android.net.Uri
-                            url = uri?.toString()
-                        } catch (_: Throwable) {}
-                    }
-                    if (url != null) {
-                        extractAppId(url)
-                        if (url.contains("access_token")) {
-                            val tokenMatch = "access_token=([^&]+)".toRegex().find(url)
-                            if (tokenMatch != null) {
-                                tryParseToken("{\"access_token\":\"${tokenMatch.groupValues[1]}\"}", "shouldOverrideUrlLoading")
-                            }
-                        }
-                    }
-                }
-            })
-            Log.d(TAG, "✅ Subclass WebViewClient hook: $className.shouldOverrideUrlLoading")
-        } catch (_: Throwable) {}
+            val act = zaloActivity?.get()
+            val context = act?.applicationContext ?: run {
+                val at = XposedHelpers.callStaticMethod(
+                    XposedHelpers.findClass("android.app.ActivityThread", null),
+                    "currentActivityThread"
+                )
+                XposedHelpers.callMethod(at, "getSystemContext") as? Context
+            } ?: return
 
-        // Hook onPageFinished
-        try {
-            XposedBridge.hookAllMethods(clazz, "onPageFinished", object : XC_MethodHook() {
-                override fun afterHookedMethod(param: MethodHookParam) {
-                    val url = param.args.getOrNull(1) as? String ?: return
-                    extractAppId(url)
-                    if (url.contains("zalo.me/openapi/access_token") || url.contains("access_token")) {
-                        val webView = param.args[0] ?: return
-                        val js = "javascript:void((function(){try{var b=document.body.innerText||document.body.textContent;if(b&&b.indexOf('access_token')!==-1){console.log('##ZALO_TOKEN_JS##'+b)}}catch(e){}})())"
-                        try {
-                            XposedHelpers.callMethod(webView, "loadUrl", js)
-                        } catch (_: Throwable) {}
-                    }
-                }
-            })
-            Log.d(TAG, "✅ Subclass WebViewClient hook: $className.onPageFinished")
-        } catch (_: Throwable) {}
+            val intent = Intent("com.autopee.LOG_EVENT").apply {
+                putExtra("level", level)
+                putExtra("log", message)
+                putExtra("message", msg)
+            }
+            
+            try {
+                context.sendBroadcast(Intent(intent).apply { `package` = "com.autopee" })
+            } catch (e: Throwable) {}
+            try {
+                context.sendBroadcast(Intent(intent).apply { `package` = "com.example.hack" })
+            } catch (e: Throwable) {}
+            context.sendBroadcast(intent)
+        } catch (t: Throwable) {}
     }
 
-    // ─────────────────────────────────────────────────
-    // HOOK 2b: WebChromeClient subclasses
-    // ─────────────────────────────────────────────────
-    private fun hookWebChromeClientSubclass(clazz: Class<*>) {
-        val className = clazz.name
-        if (hookedChromeClients.contains(className)) return
-        hookedChromeClients.add(className)
-
-        try {
-            XposedBridge.hookAllMethods(clazz, "onConsoleMessage", object : XC_MethodHook() {
-                override fun beforeHookedMethod(param: MethodHookParam) {
-                    val consoleMsg = param.args[0] ?: return
-                    val text = try {
-                        XposedHelpers.callMethod(consoleMsg, "message") as? String
-                    } catch (_: Throwable) { null } ?: return
-
-                    if (text.contains("##ZALO_TOKEN_JS##")) {
-                        val body = text.split("##ZALO_TOKEN_JS##").getOrNull(1) ?: return
-                        tryParseToken(body, "JSConsole_TokenExchanger")
-                    } else if (text.contains("access_token")) {
-                        tryParseToken(text, "JSConsole_direct")
-                    }
+    private fun extractJson(script: String): String? {
+        val idx = script.indexOf("cookiesOAuthLogins")
+        if (idx == -1) return null
+        var depth = 0
+        var start = -1
+        var i = idx
+        while (i >= 0) {
+            val c = script[i]
+            if (c == '}') {
+                depth++
+            } else if (c == '{') {
+                if (depth == 0) {
+                    start = i
+                    break
+                } else {
+                    depth--
                 }
-            })
-            Log.d(TAG, "✅ Subclass WebChromeClient hook: $className.onConsoleMessage")
-        } catch (_: Throwable) {}
-    }
-
-    // ─────────────────────────────────────────────────
-    // HOOK 3: WebView Core (loadUrl, evaluateJavascript, setClient)
-    // ─────────────────────────────────────────────────
-    fun hookWebView(classLoader: ClassLoader) {
-        try {
-            val webViewClass = XposedHelpers.findClass("android.webkit.WebView", classLoader)
-
-            // Hook loadUrl
-            XposedBridge.hookAllMethods(webViewClass, "loadUrl", object : XC_MethodHook() {
-                override fun beforeHookedMethod(param: MethodHookParam) {
-                    val url = param.args[0] as? String ?: return
-                    extractAppId(url)
-                    if (url.contains("access_token") || url.contains("jwt") || url.contains("zalo.me/openapi")) {
-                        tryParseToken(url, "WebView_loadUrl")
-                    }
-                }
-            })
-
-            // Hook evaluateJavascript & ValueCallback của nó để hứng giá trị trả về
-            XposedBridge.hookAllMethods(webViewClass, "evaluateJavascript", object : XC_MethodHook() {
-                override fun beforeHookedMethod(param: MethodHookParam) {
-                    val script = param.args[0] as? String ?: return
-                    extractAppId(script)
-                    if (script.contains("access_token") || script.contains("jwt")) {
-                        tryParseToken(script, "WebView_evalJS_script")
-                    }
-                    
-                    // Hook callback class để lấy dữ liệu trả về từ evaluateJavascript
-                    val callback = param.args.getOrNull(1) ?: return
-                    try {
-                        XposedBridge.hookAllMethods(callback.javaClass, "onReceiveValue", object : XC_MethodHook() {
-                            override fun beforeHookedMethod(p: MethodHookParam) {
-                                val value = p.args.getOrNull(0) as? String ?: return
-                                if (value.contains("access_token") || value.contains("jwt")) {
-                                    tryParseToken(value, "WebView_evalJS_callback")
-                                }
-                            }
-                        })
-                    } catch (_: Throwable) {}
-                }
-            })
-
-            // Hook setWebViewClient để lấy class client thực tế của Zalo
-            XposedBridge.hookAllMethods(webViewClass, "setWebViewClient", object : XC_MethodHook() {
-                override fun beforeHookedMethod(param: MethodHookParam) {
-                    val client = param.args.getOrNull(0) ?: return
-                    hookWebViewClientSubclass(client.javaClass)
-                }
-            })
-
-            // Hook setWebChromeClient để lấy class chrome client thực tế của Zalo
-            XposedBridge.hookAllMethods(webViewClass, "setWebChromeClient", object : XC_MethodHook() {
-                override fun beforeHookedMethod(param: MethodHookParam) {
-                    val client = param.args.getOrNull(0) ?: return
-                    hookWebChromeClientSubclass(client.javaClass)
-                }
-            })
-
-            Log.d(TAG, "✅ WebView Core hooks registered successfully")
-        } catch (e: Throwable) {
-            Log.e(TAG, "WebView Core hooks failed: ${e.message}")
+            }
+            i--
         }
-    }
-
-    // ─────────────────────────────────────────────────
-    // HOOK 4: SharedPreferences
-    // ─────────────────────────────────────────────────
-    fun hookSharedPreferences(classLoader: ClassLoader) {
-        try {
-            val editorClass = XposedHelpers.findClass("android.app.SharedPreferencesImpl\$EditorImpl", classLoader)
-            XposedBridge.hookAllMethods(editorClass, "putString", object : XC_MethodHook() {
-                override fun beforeHookedMethod(param: MethodHookParam) {
-                    val key = param.args[0] as? String ?: return
-                    val value = param.args[1] as? String ?: return
-                    if (value.length > 30 && (key.contains("token", ignoreCase = true)
-                                || key.contains("zma", ignoreCase = true)
-                                || key.contains("access", ignoreCase = true)
-                                || key.contains("jwt", ignoreCase = true))) {
-                        tryParseToken("{\"access_token\":\"$value\"}", "SharedPrefs_$key")
-                    }
+        if (start == -1) return null
+        
+        var depth2 = 0
+        var end = -1
+        var i2 = start
+        while (i2 < script.length) {
+            val c2 = script[i2]
+            if (c2 == '{') {
+                depth2++
+            } else if (c2 == '}') {
+                if (depth2 - 1 == 0) {
+                    end = i2
+                    break
+                } else {
+                    depth2--
                 }
-            })
-            Log.d(TAG, "✅ SharedPreferences putString hooked")
-        } catch (e: Throwable) {
-            Log.e(TAG, "SharedPrefs putString hook failed: ${e.message}")
+            }
+            i2++
         }
+        if (end == -1) return null
+        return script.substring(start, end + 1)
+    }
 
+    private fun parseConfigs(json: String?): List<AppConfig> {
+        val list = mutableListOf<AppConfig>()
+        if (json.isNullOrEmpty()) return list
         try {
-            val prefsClass = XposedHelpers.findClass("android.app.SharedPreferencesImpl", classLoader)
-            XposedBridge.hookAllMethods(prefsClass, "getString", object : XC_MethodHook() {
-                override fun afterHookedMethod(param: MethodHookParam) {
-                    val key = param.args.getOrNull(0) as? String ?: return
-                    val value = param.result as? String ?: return
-                    if (value.length > 30 && (key.contains("token", ignoreCase = true)
-                                || key.contains("zma", ignoreCase = true)
-                                || key.contains("access", ignoreCase = true)
-                                || key.contains("jwt", ignoreCase = true))) {
-                        tryParseToken("{\"access_token\":\"$value\"}", "SharedPrefs_get_$key")
-                    }
-                }
-            })
-            Log.d(TAG, "✅ SharedPreferences getString hooked")
-        } catch (e: Throwable) {
-            Log.e(TAG, "SharedPrefs getString hook failed: ${e.message}")
+            val arr = JSONArray(json)
+            for (i in 0 until arr.length()) {
+                val o = arr.getJSONObject(i)
+                val appId = o.optString("appId").ifEmpty { o.optString("app_id") }
+                val cfg = AppConfig(
+                    id = o.optString("id", UUID.randomUUID().toString()),
+                    name = o.optString("name", ""),
+                    appId = appId,
+                    adbPrefix = o.optString("adbPrefix", "com.autopee.$appId"),
+                    deeplink = o.optString("deeplink", "")
+                )
+                list.add(cfg)
+            }
+        } catch (e: Exception) {
+            Log.e(TAG, "Error parsing configs", e)
         }
-    }
-
-    // ─────────────────────────────────────────────────
-    // HOOK 5: HttpURLConnection
-    // ─────────────────────────────────────────────────
-    fun hookHttpUrlConnection(classLoader: ClassLoader) {
-        try {
-            val connClass = XposedHelpers.findClass("com.android.okhttp.internal.huc.HttpURLConnectionImpl", classLoader)
-            XposedBridge.hookAllMethods(connClass, "getInputStream", object : XC_MethodHook() {
-                override fun afterHookedMethod(param: MethodHookParam) {
-                    try {
-                        val stream = param.result as? java.io.InputStream ?: return
-                        val content = stream.bufferedReader().readText()
-                        tryParseToken(content, "HttpURLConnection")
-                    } catch (_: Throwable) {}
-                }
-            })
-            Log.d(TAG, "✅ HttpURLConnection hooked")
-        } catch (_: Throwable) {}
-    }
-
-    // ─────────────────────────────────────────────────
-    // HOOK 6: JavaScript Interface
-    // ─────────────────────────────────────────────────
-    fun hookJavaScriptInterface(classLoader: ClassLoader) {
-        try {
-            val webViewClass = XposedHelpers.findClass("android.webkit.WebView", classLoader)
-            XposedBridge.hookAllMethods(webViewClass, "addJavascriptInterface", object : XC_MethodHook() {
-                override fun beforeHookedMethod(param: MethodHookParam) {
-                    val obj = param.args[0] ?: return
-                    val methods = obj.javaClass.declaredMethods
-                    for (method in methods) {
-                        if (method.parameterTypes.size == 1 && method.parameterTypes[0] == String::class.java) {
-                            try {
-                                XposedBridge.hookMethod(method, object : XC_MethodHook() {
-                                    override fun beforeHookedMethod(p: MethodHookParam) {
-                                        val data = p.args[0] as? String ?: return
-                                        tryParseToken(data, "JSInterface_req_${method.name}")
-                                    }
-                                    override fun afterHookedMethod(p: MethodHookParam) {
-                                        val res = p.result as? String ?: return
-                                        tryParseToken(res, "JSInterface_res_${method.name}")
-                                    }
-                                })
-                            } catch (_: Throwable) {}
-                        }
-                    }
-                }
-            })
-            Log.d(TAG, "✅ JSInterface hooked")
-        } catch (_: Throwable) {}
+        return list
     }
 }
