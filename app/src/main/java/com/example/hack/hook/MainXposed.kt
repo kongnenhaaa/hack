@@ -34,7 +34,8 @@ class MainXposed : IXposedHookLoadPackage {
         try { ZaloHooker.hookOkHttp(lpparam.classLoader) } catch (e: Exception) { Log.e("ZaloHacker", "OkHttp failed", e) }
         try { ZaloHooker.hookWebView(lpparam.classLoader) } catch (e: Exception) { Log.e("ZaloHacker", "WebView failed", e) }
         try { ZaloHooker.hookSharedPreferences(lpparam.classLoader) } catch (e: Exception) { Log.e("ZaloHacker", "SharedPrefs failed", e) }
-        try { ZaloHooker.hookHttpUrlConnection(lpparam.classLoader) } catch (e: Exception) { Log.e("ZaloHacker", "HttpURLConn failed", e) }
+        // Disabled to ensure Zalo's native HTTP flow is untouched (prevents login/register issues)
+        // try { ZaloHooker.hookHttpUrlConnection(lpparam.classLoader) } catch (e: Exception) { Log.e("ZaloHacker", "HttpURLConn failed", e) }
         try { ZaloHooker.hookJavaScriptInterface(lpparam.classLoader) } catch (e: Exception) { Log.e("ZaloHacker", "JSInterface failed", e) }
 
         Log.d("ZaloHacker", "✅ All hooks installed for Zalo v26.05.01")
