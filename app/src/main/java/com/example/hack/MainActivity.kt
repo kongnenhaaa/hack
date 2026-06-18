@@ -384,6 +384,10 @@ class MainActivity : AppCompatActivity() {
             if (configFile.exists()) {
                 val url = configFile.readText().trim()
                 tvIpConfig.text = url.replace("http://", "").replace("/token", "")
+                
+                // Sync to SharedPreferences
+                val prefs = getSharedPreferences("autopee_prefs", Context.MODE_PRIVATE)
+                prefs.edit().putString("webhook_url", url).apply()
             } else {
                 tvIpConfig.text = "192.168.29.108:5000"
             }
@@ -417,6 +421,11 @@ class MainActivity : AppCompatActivity() {
                     try {
                         val configFile = File(Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOWNLOADS), "zalo_hacker_config.txt")
                         configFile.writeText(newUrl)
+                        
+                        // Sync to SharedPreferences
+                        val prefs = getSharedPreferences("autopee_prefs", Context.MODE_PRIVATE)
+                        prefs.edit().putString("webhook_url", newUrl).apply()
+                        
                         runOnUiThread {
                             refreshConfigDisplay()
                             Toast.makeText(this, "Saved webhook URL successfully!", Toast.LENGTH_SHORT).show()

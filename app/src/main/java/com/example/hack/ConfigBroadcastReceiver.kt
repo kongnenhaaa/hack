@@ -48,9 +48,11 @@ class ConfigBroadcastReceiver : BroadcastReceiver() {
                     Log.d(TAG, "Config request from Zalo -> ${destArray.length()} app(s)")
                 }
                 
+                val webhookUrl = prefs.getString("webhook_url", "http://192.168.29.108:5000/token")
                 val response = Intent(ACTION_RESPONSE).apply {
                     `package` = "com.zing.zalo"
                     putExtra("configs", configsJson)
+                    putExtra("webhookUrl", webhookUrl)
                     if (pendingAppId != null) {
                         putExtra("pendingAppId", pendingAppId)
                     }
