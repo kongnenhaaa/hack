@@ -11,8 +11,8 @@ import java.util.UUID
 class ConfigBroadcastReceiver : BroadcastReceiver() {
 
     companion object {
-        const val ACTION_REQUEST = "com.autopee.REQUEST_CONFIG"
-        const val ACTION_RESPONSE = "com.autopee.CONFIG_RESPONSE"
+        const val ACTION_REQUEST = "com.example.hack.REQUEST_CONFIG"
+        const val ACTION_RESPONSE = "com.example.hack.CONFIG_RESPONSE"
         private const val TAG = "ConfigReceiver"
     }
 

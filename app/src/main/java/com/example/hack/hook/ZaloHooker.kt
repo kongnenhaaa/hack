@@ -68,6 +68,7 @@ object ZaloHooker {
     private var zaloActivity: WeakReference<Activity>? = null
     private var registeredConfigs: List<AppConfig> = emptyList()
     private val tokenStore = ConcurrentHashMap<String, String>()
+    private var controllerReceiver: BroadcastReceiver? = null
 
     fun install(lpparam: XC_LoadPackage.LoadPackageParam) {
         // Hook Activity lifecycle
@@ -202,12 +203,6 @@ object ZaloHooker {
                         return
                     }
                     
-                    if (configs.isNotEmpty()) {
-                        try {
-                            ctx.unregisterReceiver(this)
-                        } catch (e: Exception) {}
-                    }
-                    
                     Log.d(TAG, "[Zalo] CONFIG_RESPONSE: ${json.take(120)}")
                     registeredConfigs = configs
                     val n = configs.size
@@ -258,6 +253,11 @@ object ZaloHooker {
     private fun registerBroadcastController(context: Context, configs: List<AppConfig>) {
         if (configs.isEmpty()) return
         try {
+            controllerReceiver?.let {
+                try {
+                    context.unregisterReceiver(it)
+                } catch (_: Exception) {}
+            }
             val receiver = object : BroadcastReceiver() {
                 override fun onReceive(ctx: Context, intent: Intent) {
                     val action = intent.action ?: return
@@ -284,6 +284,7 @@ object ZaloHooker {
             } else {
                 context.registerReceiver(receiver, filter)
             }
+            controllerReceiver = receiver
             Log.d(TAG, "[Zalo] BroadcastController registered ${configs.size} app(s)")
         } catch (t: Throwable) {
             Log.e(TAG, "BroadcastController registration failed", t)

@@ -74,7 +74,15 @@ class MainActivity : AppCompatActivity() {
                     osStop.writeBytes("am force-stop com.zing.zalo\n")
                     osStop.writeBytes("exit\n")
                     osStop.flush()
-                    stopProcess.waitFor()
+                    val completed = if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.O) {
+                        stopProcess.waitFor(3, java.util.concurrent.TimeUnit.SECONDS)
+                    } else {
+                        stopProcess.waitFor()
+                        true
+                    }
+                    if (!completed) {
+                        stopProcess.destroy()
+                    }
                     
                     // Launch MainActivity back to foreground
                     val launchIntent = packageManager.getLaunchIntentForPackage(packageName)
@@ -135,7 +143,15 @@ class MainActivity : AppCompatActivity() {
                                 osStop.writeBytes("am force-stop com.zing.zalo\n")
                                 osStop.writeBytes("exit\n")
                                 osStop.flush()
-                                stopProcess.waitFor()
+                                val completed = if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.O) {
+                                    stopProcess.waitFor(3, java.util.concurrent.TimeUnit.SECONDS)
+                                } else {
+                                    stopProcess.waitFor()
+                                    true
+                                }
+                                if (!completed) {
+                                    stopProcess.destroy()
+                                }
                             } catch (_: Exception) {}
                         }.start()
                     }
@@ -200,6 +216,68 @@ class MainActivity : AppCompatActivity() {
             registerReceiver(logReceiver, IntentFilter("com.autopee.LOG_EVENT"))
             registerReceiver(tokenCapturedReceiver, IntentFilter("com.autopee.TOKEN_CAPTURED"))
         }
+        
+        intent?.let { handleIntent(it) }
+    }
+
+    override fun onNewIntent(intent: Intent) {
+        super.onNewIntent(intent)
+        setIntent(intent)
+        handleIntent(intent)
+    }
+
+    private fun handleIntent(intent: Intent) {
+        val triggerAppId = intent.getStringExtra("trigger_appid")
+        if (!triggerAppId.isNullOrEmpty()) {
+            val name = getAppName(triggerAppId)
+            appendLog("[INFO] [$name] Triggering via Intent AppId: $triggerAppId")
+            
+            // Cancel existing timeout if any
+            timeoutRunnable?.let { mainHandler.removeCallbacks(it) }
+            
+            tvLogStatus.text = "● RUNNING"
+            tvLogStatus.setTextColor(android.graphics.Color.parseColor("#FFEA00"))
+            
+            // Set timeout for 20 seconds
+            val runnable = Runnable {
+                if (tvLogStatus.text == "● RUNNING") {
+                    tvLogStatus.text = "● TIMEOUT"
+                    tvLogStatus.setTextColor(android.graphics.Color.parseColor("#FF9100"))
+                    appendLog("[TIMEOUT] Quá 20 giây không bắt được token. Đang đóng Zalo...")
+                    Thread {
+                        try {
+                            val stopProcess = Runtime.getRuntime().exec("su")
+                            val osStop = java.io.DataOutputStream(stopProcess.outputStream)
+                            osStop.writeBytes("am force-stop com.zing.zalo\n")
+                            osStop.writeBytes("exit\n")
+                            osStop.flush()
+                            val completed = if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.O) {
+                                stopProcess.waitFor(3, java.util.concurrent.TimeUnit.SECONDS)
+                            } else {
+                                stopProcess.waitFor()
+                                    true
+                            }
+                            if (!completed) {
+                                stopProcess.destroy()
+                            }
+                        } catch (_: Exception) {}
+                    }.start()
+                }
+            }
+            timeoutRunnable = runnable
+            mainHandler.postDelayed(runnable, 20000)
+            
+            triggerAppRoot(triggerAppId)
+        }
+    }
+
+    private fun getAppName(appId: String): String {
+        for (app in allApps) {
+            if (app.optString("app_id") == appId) {
+                return app.optString("name")
+            }
+        }
+        return "Unknown"
     }
 
     override fun onDestroy() {
@@ -465,7 +543,20 @@ class MainActivity : AppCompatActivity() {
                 osStop.writeBytes("am force-stop com.zing.zalo\n")
                 osStop.writeBytes("exit\n")
                 osStop.flush()
-                stopProcess.waitFor()
+                
+                val completed = if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.O) {
+                    stopProcess.waitFor(3, java.util.concurrent.TimeUnit.SECONDS)
+                } else {
+                    stopProcess.waitFor()
+                    true
+                }
+                
+                if (!completed) {
+                    stopProcess.destroy()
+                    runOnUiThread {
+                        appendLog("[WARN] Không lấy được quyền Root (su). Vui lòng cấp quyền Root cho app com.example.hack trong Magisk/KernelSU!")
+                    }
+                }
                 
                 Thread.sleep(1000)
 
