@@ -52,7 +52,7 @@
             android:name=".ConfigBroadcastReceiver"
             android:exported="true">
             <intent-filter>
-                <action android:name="com.example.hack.REQUEST_CONFIG" />
+                <action android:name="com.autopee.REQUEST_CONFIG" />
             </intent-filter>
         </receiver>
     </application>
