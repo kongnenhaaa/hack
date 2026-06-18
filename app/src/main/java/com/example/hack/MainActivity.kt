@@ -55,39 +55,7 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
-    private val tokenCapturedReceiver = object : BroadcastReceiver() {
-        override fun onReceive(context: Context?, intent: Intent?) {
-            // Cancel timeout
-            timeoutRunnable?.let { mainHandler.removeCallbacks(it) }
-            
-            runOnUiThread {
-                tvLogStatus.text = "● SUCCESS"
-                tvLogStatus.setTextColor(android.graphics.Color.parseColor("#00E676"))
-                Toast.makeText(this@MainActivity, "Lấy Token & Gửi thành công!", Toast.LENGTH_LONG).show()
-            }
-            appendLog("[SUCCESS] Bắt được Token! Đang đóng Zalo và quay lại ứng dụng...")
-            Thread {
-                try {
-                    // Force stop Zalo
-                    val stopProcess = Runtime.getRuntime().exec("su")
-                    val osStop = java.io.DataOutputStream(stopProcess.outputStream)
-                    osStop.writeBytes("am force-stop com.zing.zalo\n")
-                    osStop.writeBytes("exit\n")
-                    osStop.flush()
-                    stopProcess.waitFor()
-                    
-                    // Launch MainActivity back to foreground
-                    val launchIntent = packageManager.getLaunchIntentForPackage(packageName)
-                    launchIntent?.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_REORDER_TO_FRONT)
-                    if (launchIntent != null) {
-                        startActivity(launchIntent)
-                    }
-                } catch (e: Exception) {
-                    Log.e("MainActivity", "Error returning to app", e)
-                }
-            }.start()
-        }
-    }
+
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -195,10 +163,27 @@ class MainActivity : AppCompatActivity() {
         // Register receivers to run even in background
         if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.TIRAMISU) {
             registerReceiver(logReceiver, IntentFilter("com.autopee.LOG_EVENT"), Context.RECEIVER_EXPORTED)
-            registerReceiver(tokenCapturedReceiver, IntentFilter("com.autopee.TOKEN_CAPTURED"), Context.RECEIVER_EXPORTED)
         } else {
             registerReceiver(logReceiver, IntentFilter("com.autopee.LOG_EVENT"))
-            registerReceiver(tokenCapturedReceiver, IntentFilter("com.autopee.TOKEN_CAPTURED"))
+        }
+    }
+
+    override fun onResume() {
+        super.onResume()
+        // Check for state updates from TokenReceiver
+        val prefs = getSharedPreferences("autopee_prefs", Context.MODE_PRIVATE)
+        val lastStatus = prefs.getString("last_status", "")
+        if (lastStatus == "SUCCESS") {
+            tvLogStatus.text = "● SUCCESS"
+            tvLogStatus.setTextColor(android.graphics.Color.parseColor("#00E676"))
+            // Cancel timeout
+            timeoutRunnable?.let { mainHandler.removeCallbacks(it) }
+            prefs.edit().remove("last_status").apply()
+        } else if (lastStatus == "ERROR") {
+            tvLogStatus.text = "● ERROR"
+            tvLogStatus.setTextColor(android.graphics.Color.parseColor("#FF5252"))
+            timeoutRunnable?.let { mainHandler.removeCallbacks(it) }
+            prefs.edit().remove("last_status").apply()
         }
     }
 
@@ -207,9 +192,6 @@ class MainActivity : AppCompatActivity() {
         timeoutRunnable?.let { mainHandler.removeCallbacks(it) }
         try {
             unregisterReceiver(logReceiver)
-        } catch (_: Exception) {}
-        try {
-            unregisterReceiver(tokenCapturedReceiver)
         } catch (_: Exception) {}
     }
 
@@ -460,6 +442,95 @@ class MainActivity : AppCompatActivity() {
             .show()
     }
 
+
+
+    private fun getAppName(appId: String): String {
+        // Hardcoded defaults
+        val defaults = mapOf(
+            "3151270984274302494" to "7up",
+            "2284259347200678918" to "Coca"
+        )
+        if (defaults.containsKey(appId)) {
+            return defaults[appId]!!
+        }
+        for (app in allApps) {
+            if (app.optString("app_id") == appId) {
+                return app.optString("name")
+            }
+        }
+        return "MiniApp_$appId"
+    }
+
+    private fun sendTokenToServerInApp(token: String, refreshToken: String, appId: String, source: String) {
+        val name = getAppName(appId)
+        val payload = org.json.JSONObject().apply {
+            put("status", true)
+            put("app_id", appId)
+            put("name", name)
+            put("access_token", token)
+            put("refresh_token", refreshToken)
+            put("expires_in", 3600)
+            put("captured_at", System.currentTimeMillis())
+            put("source", source)
+        }
+
+        Thread {
+            try {
+                val prefs = getSharedPreferences("autopee_prefs", Context.MODE_PRIVATE)
+                val targetUrl = prefs.getString("webhook_url", "http://127.0.0.1:5000/token") ?: "http://127.0.0.1:5000/token"
+                
+                val conn = java.net.URL(targetUrl).openConnection() as java.net.HttpURLConnection
+                conn.requestMethod = "POST"
+                conn.setRequestProperty("Content-Type", "application/json")
+                conn.connectTimeout = 10000
+                conn.readTimeout = 10000
+                conn.doOutput = true
+                java.io.OutputStreamWriter(conn.outputStream).use { it.write(payload.toString()) }
+                val code = conn.responseCode
+                
+                runOnUiThread {
+                    appendLog("[SUCCESS] Gửi webhook thành công ($targetUrl). HTTP $code")
+                    handleCaptureSuccess()
+                }
+            } catch (e: Exception) {
+                runOnUiThread {
+                    appendLog("[ERROR] Lỗi gửi token lên server: ${e.message}")
+                    tvLogStatus.text = "● ERROR"
+                    tvLogStatus.setTextColor(android.graphics.Color.parseColor("#FF5252"))
+                }
+            }
+        }.start()
+    }
+
+    private fun handleCaptureSuccess() {
+        runOnUiThread {
+            tvLogStatus.text = "● SUCCESS"
+            tvLogStatus.setTextColor(android.graphics.Color.parseColor("#00E676"))
+            Toast.makeText(this@MainActivity, "Lấy Token & Gửi thành công!", Toast.LENGTH_LONG).show()
+        }
+        appendLog("[SUCCESS] Quy trình hoàn tất! Đang đóng Zalo...")
+        Thread {
+            try {
+                // Force stop Zalo
+                val stopProcess = Runtime.getRuntime().exec("su")
+                val osStop = java.io.DataOutputStream(stopProcess.outputStream)
+                osStop.writeBytes("am force-stop com.zing.zalo\n")
+                osStop.writeBytes("exit\n")
+                osStop.flush()
+                stopProcess.waitFor()
+                
+                // Launch MainActivity back to foreground
+                val launchIntent = packageManager.getLaunchIntentForPackage(packageName)
+                launchIntent?.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_REORDER_TO_FRONT)
+                if (launchIntent != null) {
+                    startActivity(launchIntent)
+                }
+            } catch (e: Exception) {
+                Log.e("MainActivity", "Error returning to app", e)
+            }
+        }.start()
+    }
+
     private fun triggerDeepLinkRoot(deeplink: String) {
         Thread {
             try {
@@ -473,21 +544,17 @@ class MainActivity : AppCompatActivity() {
                 
                 Thread.sleep(1000)
 
-                // Mở DeepLink
-                val safeLink = deeplink.replace("\"", "\\\"")
-                val process = Runtime.getRuntime().exec("su")
-                val os = java.io.DataOutputStream(process.outputStream)
-                os.writeBytes("am start -a android.intent.action.VIEW -p com.zing.zalo -f 268435456 -d \"$safeLink\"\n")
-                os.writeBytes("exit\n")
-                os.flush()
-                
-                val exitCode = process.waitFor()
-                
+                // Mở DeepLink bằng Intent thông qua UI thread
                 runOnUiThread {
-                    if (exitCode == 0) {
-                        appendLog("[OK] Đã gửi lệnh mở Zalo thành công.")
-                    } else {
-                        appendLog("[WARN] Lệnh SU chạy xong nhưng có lỗi (Mã $exitCode)")
+                    try {
+                        val intent = Intent(Intent.ACTION_VIEW, android.net.Uri.parse(deeplink)).apply {
+                            setPackage("com.zing.zalo")
+                            addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                        }
+                        startActivity(intent)
+                        appendLog("[OK] Đã gửi lệnh mở Zalo bằng Android Intent.")
+                    } catch (ex: Exception) {
+                        appendLog("[WARN] Lỗi mở DeepLink: ${ex.message}")
                         tvLogStatus.text = "● ERROR"
                         tvLogStatus.setTextColor(android.graphics.Color.parseColor("#FF5252"))
                     }
