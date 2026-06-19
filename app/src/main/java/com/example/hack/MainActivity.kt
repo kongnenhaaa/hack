@@ -65,9 +65,13 @@ class MainActivity : AppCompatActivity() {
                 tvLogStatus.setTextColor(android.graphics.Color.parseColor("#00E676"))
                 Toast.makeText(this@MainActivity, "Lấy Token & Gửi thành công!", Toast.LENGTH_LONG).show()
             }
-            appendLog("[SUCCESS] Bắt được Token! Đang đóng Zalo và quay lại ứng dụng...")
+            appendLog("[SUCCESS] Bắt được Token! Đang gửi webhook và đóng Zalo...")
             Thread {
                 try {
+                    // Delay 1.5s to ensure ZaloHooker has enough time to send the HTTP Webhook 
+                    // over higher latency networks (like Tailscale) before Zalo is killed.
+                    Thread.sleep(1500)
+                    
                     // Force stop Zalo
                     val stopProcess = Runtime.getRuntime().exec("su")
                     val osStop = java.io.DataOutputStream(stopProcess.outputStream)
@@ -380,14 +384,23 @@ class MainActivity : AppCompatActivity() {
 
     private fun refreshConfigDisplay() {
         try {
-            val configFile = File(Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOWNLOADS), "zalo_hacker_config.txt")
-            if (configFile.exists()) {
-                val url = configFile.readText().trim()
+            // Priority 1: SharedPreferences
+            val prefs = getSharedPreferences("autopee_prefs", Context.MODE_PRIVATE)
+            var url = prefs.getString("webhook_url", null)
+            
+            // Priority 2: Public file fallback
+            if (url == null) {
+                try {
+                    val configFile = File(Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOWNLOADS), "zalo_hacker_config.txt")
+                    if (configFile.exists()) {
+                        url = configFile.readText().trim()
+                        prefs.edit().putString("webhook_url", url).apply()
+                    }
+                } catch (e: Exception) {}
+            }
+            
+            if (url != null) {
                 tvIpConfig.text = url.replace("http://", "").replace("/token", "")
-                
-                // Sync to SharedPreferences
-                val prefs = getSharedPreferences("autopee_prefs", Context.MODE_PRIVATE)
-                prefs.edit().putString("webhook_url", url).apply()
             } else {
                 tvIpConfig.text = "192.168.29.108:5000"
             }
@@ -419,21 +432,26 @@ class MainActivity : AppCompatActivity() {
             if (newUrl.isNotEmpty() && newUrl.startsWith("http")) {
                 Thread {
                     try {
-                        val configFile = File(Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOWNLOADS), "zalo_hacker_config.txt")
-                        configFile.writeText(newUrl)
-                        
-                        // Sync to SharedPreferences
+                        // Priority 1: Sync to SharedPreferences FIRST
                         val prefs = getSharedPreferences("autopee_prefs", Context.MODE_PRIVATE)
                         prefs.edit().putString("webhook_url", newUrl).apply()
                         
+                        // Priority 2: Try updating public file (often fails if created by ADB due to permission)
+                        try {
+                            val configFile = File(Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOWNLOADS), "zalo_hacker_config.txt")
+                            configFile.writeText(newUrl)
+                        } catch (e: Exception) {
+                            Log.w("MainActivity", "Public config file update ignored (ADB owned): ${e.message}")
+                        }
+                        
                         runOnUiThread {
                             refreshConfigDisplay()
-                            Toast.makeText(this, "Saved webhook URL successfully!", Toast.LENGTH_SHORT).show()
+                            Toast.makeText(this@MainActivity, "Saved webhook URL successfully!", Toast.LENGTH_SHORT).show()
                             appendLog("[CONFIG] Updated server URL: $newUrl")
                         }
                     } catch (e: Exception) {
                         runOnUiThread {
-                            Toast.makeText(this, "Error saving config: ${e.message}", Toast.LENGTH_LONG).show()
+                            Toast.makeText(this@MainActivity, "Error saving config: ${e.message}", Toast.LENGTH_LONG).show()
                         }
                     }
                 }.start()
