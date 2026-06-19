@@ -60,6 +60,12 @@ class MainActivity : AppCompatActivity() {
             // Cancel timeout
             timeoutRunnable?.let { mainHandler.removeCallbacks(it) }
             
+            // Clear pending trigger session info
+            context?.let { ctx ->
+                val prefs = ctx.getSharedPreferences("autopee_prefs", Context.MODE_PRIVATE)
+                prefs.edit().remove("pending_trigger_appid").remove("pending_trigger_time").apply()
+            }
+            
             runOnUiThread {
                 tvLogStatus.text = "● SUCCESS"
                 tvLogStatus.setTextColor(android.graphics.Color.parseColor("#00E676"))
@@ -560,7 +566,10 @@ class MainActivity : AppCompatActivity() {
 
     private fun triggerAppRoot(appId: String) {
         val prefs = getSharedPreferences("autopee_prefs", Context.MODE_PRIVATE)
-        prefs.edit().putString("pending_trigger_appid", appId).apply()
+        prefs.edit()
+            .putString("pending_trigger_appid", appId)
+            .putLong("pending_trigger_time", System.currentTimeMillis())
+            .apply()
 
         Thread {
             try {

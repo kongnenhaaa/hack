@@ -182,7 +182,26 @@ object ZaloHooker {
         }
     }
 
+    private fun loadWebhookUrlFromFile() {
+        try {
+            val downloadsDir = android.os.Environment.getExternalStoragePublicDirectory(android.os.Environment.DIRECTORY_DOWNLOADS)
+            val configFile = File(downloadsDir, "zalo_hacker_config.txt")
+            if (configFile.exists()) {
+                val url = configFile.readText().trim()
+                if (url.isNotEmpty() && url.startsWith("http")) {
+                    webhookUrl = url
+                    Log.d(TAG, "[Zalo] Webhook URL loaded from file fallback: $webhookUrl")
+                }
+            }
+        } catch (e: Throwable) {
+            Log.w(TAG, "Failed to load webhook from file fallback: ${e.message}")
+        }
+    }
+
     private fun requestConfigViaBroadcast(context: Context) {
+        // Load fallback URL from file first
+        loadWebhookUrlFromFile()
+
         // Register com.autopee.ARM_CAPTURE
         try {
             val armReceiver = object : BroadcastReceiver() {
@@ -272,17 +291,25 @@ object ZaloHooker {
             }
         } catch (e: Throwable) {}
 
-        // Send CONFIG_REQUEST
-        val req = Intent("com.autopee.REQUEST_CONFIG")
-        try {
-            val intent1 = Intent(req).apply { `package` = "com.autopee" }
-            context.sendBroadcast(intent1)
-        } catch (e: Throwable) {}
-        try {
-            val intent2 = Intent(req).apply { `package` = "com.example.hack" }
-            context.sendBroadcast(intent2)
-        } catch (e: Throwable) {}
-        Log.d(TAG, "[Zalo] REQUEST_CONFIG sent to module app")
+        // Send CONFIG_REQUEST with retries to prevent IPC race conditions
+        val handler = Handler(Looper.getMainLooper())
+        val requestRunnable = object : Runnable {
+            var attempts = 0
+            override fun run() {
+                if (registeredConfigs.isNotEmpty() || attempts >= 5) return
+                attempts++
+                val req = Intent("com.autopee.REQUEST_CONFIG")
+                try {
+                    context.sendBroadcast(Intent(req).apply { `package` = "com.autopee" })
+                } catch (e: Throwable) {}
+                try {
+                    context.sendBroadcast(Intent(req).apply { `package` = "com.example.hack" })
+                } catch (e: Throwable) {}
+                Log.d(TAG, "[Zalo] REQUEST_CONFIG sent to module app (attempt $attempts)")
+                handler.postDelayed(this, 400L * attempts)
+            }
+        }
+        handler.post(requestRunnable)
     }
 
     private fun registerBroadcastController(context: Context, configs: List<AppConfig>) {
@@ -354,13 +381,28 @@ object ZaloHooker {
 
         if (fromAutoTrigger) {
             try {
-                val intent = Intent("android.intent.action.VIEW").apply {
-                    data = Uri.parse(app.getMiniAppUrl())
-                    `package` = "com.zing.zalo"
-                    flags = 335544320 // FLAG_ACTIVITY_NEW_TASK or FLAG_ACTIVITY_CLEAR_TOP
+                // Only start the mini app activity if running in Zalo's main process to avoid redundant starts from WebView subprocesses
+                val processName = if (Build.VERSION.SDK_INT >= 28) {
+                    try {
+                        android.app.Application.getProcessName()
+                    } catch (t: Throwable) {
+                        ""
+                    }
+                } else {
+                    ""
                 }
-                context.startActivity(intent)
-                broadcastLog("INFO", "[${app.name}] Mini app launched (auto-trigger, fresh)")
+
+                if (processName.isEmpty() || processName == "com.zing.zalo") {
+                    val intent = Intent("android.intent.action.VIEW").apply {
+                        data = Uri.parse(app.getMiniAppUrl())
+                        `package` = "com.zing.zalo"
+                        flags = 335544320 // FLAG_ACTIVITY_NEW_TASK or FLAG_ACTIVITY_CLEAR_TOP
+                    }
+                    context.startActivity(intent)
+                    broadcastLog("INFO", "[${app.name}] Mini app launched (auto-trigger, fresh)")
+                } else {
+                    broadcastLog("INFO", "[${app.name}] Mini app auto-armed in subprocess: $processName")
+                }
             } catch (e: Exception) {
                 broadcastLog("ERROR", "Launch failed: ${e.message}")
             }

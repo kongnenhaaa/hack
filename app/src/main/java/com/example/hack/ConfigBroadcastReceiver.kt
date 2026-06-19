@@ -40,10 +40,20 @@ class ConfigBroadcastReceiver : BroadcastReceiver() {
                 
                 val configsJson = destArray.toString()
                 val pendingAppId = prefs.getString("pending_trigger_appid", null)
-                
-                if (pendingAppId != null) {
-                    prefs.edit().remove("pending_trigger_appid").apply()
-                    Log.d(TAG, "Config request from Zalo -> ${destArray.length()} app(s) [pending: $pendingAppId]")
+                val pendingTime = prefs.getLong("pending_trigger_time", 0L)
+                val now = System.currentTimeMillis()
+
+                // Keep the trigger valid for a 15-second window so multiple processes and retries can query it
+                val isValidTrigger = pendingAppId != null && (now - pendingTime < 15000)
+                val finalPendingAppId = if (isValidTrigger) pendingAppId else null
+
+                if (pendingAppId != null && !isValidTrigger) {
+                    // Clean up expired trigger session
+                    prefs.edit().remove("pending_trigger_appid").remove("pending_trigger_time").apply()
+                }
+
+                if (finalPendingAppId != null) {
+                    Log.d(TAG, "Config request from Zalo -> ${destArray.length()} app(s) [pending: $finalPendingAppId]")
                 } else {
                     Log.d(TAG, "Config request from Zalo -> ${destArray.length()} app(s)")
                 }
@@ -53,8 +63,8 @@ class ConfigBroadcastReceiver : BroadcastReceiver() {
                     `package` = "com.zing.zalo"
                     putExtra("configs", configsJson)
                     putExtra("webhookUrl", webhookUrl)
-                    if (pendingAppId != null) {
-                        putExtra("pendingAppId", pendingAppId)
+                    if (finalPendingAppId != null) {
+                        putExtra("pendingAppId", finalPendingAppId)
                     }
                 }
                 context.sendBroadcast(response)
